@@ -15,6 +15,8 @@
  */
 import { EventEmitter } from "node:events";
 import dgram from "node:dgram";
+import { resolve4 } from "node:dns/promises";
+import { isIP } from "node:net";
 import {
   constants,
   createCipheriv,
@@ -106,10 +108,12 @@ const RECEIVE_BUFFER_BYTES = 4 * 1024 * 1024;
  * Published because it bounds every wait on a session connecting — a second number for the same deadline
  * elsewhere would outlive the connection it waits on and charge the difference to every failure.
  *
- * Thirty seconds is the budget the vendor app gives its own remote connect, which runs the hole-punch and,
- * once the lookup server has acknowledged the P2P request for 24 lookup rounds, the relay handshake inside it.
+ * The relay handshake starts once the lookup server has acknowledged the P2P request for 24 lookup rounds, so
+ * about 25 s in. The vendor app's own remote connect has a 30 s budget, which leaves the handshake 3–6 s.
+ * Forty-five seconds keeps the vendor's threshold and gives the handshake about 20 s to complete. A station that
+ * never acknowledges the request, as an offline one does, takes this long to fail.
  */
-export const CONNECT_TIMEOUT_MS = 30_000;
+export const CONNECT_TIMEOUT_MS = 45_000;
 /**
  * The channel a command addresses the station itself on, rather than one of its cameras, and the value a
  * session's channel-taking methods resolve an omitted channel to.
@@ -233,6 +237,25 @@ const SEQUENCE_LOOKBACK = 0x8000;
  * so the depth is what caps that second cost, at a bounded run of datagrams instead of half the space.
  */
 const STALE_RETRANSMIT_DEPTH = 1024;
+
+/**
+ * The lookup servers with each hostname resolved once to an IPv4 address. IPs pass through; a hostname that
+ * does not resolve is dropped.
+ */
+async function resolveLookupServers(addresses: Address[]): Promise<Address[]> {
+  const resolved = await Promise.all(
+    addresses.map(async (addr) => {
+      if (isIP(addr.host)) return addr;
+      try {
+        const [host] = await resolve4(addr.host);
+        return host ? { host, port: addr.port } : undefined;
+      } catch {
+        return undefined;
+      }
+    }),
+  );
+  return resolved.filter((addr): addr is Address => addr !== undefined);
+}
 
 /** Additional UDP source ports registered alongside the session's own during cloud lookup. */
 const PUNCH_PROBE_SOCKETS = 7;
@@ -740,8 +763,8 @@ export class P2PSession extends EventEmitter {
    * `resolveCipherKey`), run the ECIES unwrap with the ECC key, and `setLevel2Key()`. A cipher with no
    * ECC key uses its RSA key instead and holds the RSA-decrypted 16-byte key as the AES-128-ECB level-2
    * key. One-shot; emits `level2Ready` only when the AES-256-GCM key is negotiated, traces
-   * `level2-set-payload-only` instead for the AES-128-ECB key, and emits `error` on failure
-   * (non-fatal — level-1 traffic keeps working regardless).
+   * `level2-set-payload-only` instead for the AES-128-ECB key, and emits `error` when the ECC unwrap
+   * fails; an RSA unwrap failure is only traced (non-fatal either way — level-1 traffic keeps working).
    *
    * Every outcome settles the wait in {@link awaitLevel2Key}, because being one-shot is what makes a
    * failure final for this connection generation: nothing will retry it there, so a later command must be
@@ -772,7 +795,7 @@ export class P2PSession extends EventEmitter {
         if (!key) {
           this.trace({ phase: "level2-unavailable", reason: "derivation-failed", cipherId });
           this.settleLevel2();
-          this.emit("error", new Error(`level-2 key derivation failed (cipher_id ${cipherId})`));
+          if (eccPrivHex) this.emit("error", new Error(`level-2 key derivation failed (cipher_id ${cipherId})`));
           return;
         }
         if (eccPrivHex) {
@@ -894,6 +917,13 @@ export class P2PSession extends EventEmitter {
 
     const { dskKey, cloudAddresses } = this.cfg;
     this.cloudLookup = dskKey && cloudAddresses?.length ? { key: dskKey, addresses: cloudAddresses } : undefined;
+    if (this.cloudLookup && cloudAddresses) {
+      const generation = this.connectionGeneration;
+      void resolveLookupServers(cloudAddresses).then((addresses) => {
+        if (this.cloudLookup && !this.closed && generation === this.connectionGeneration)
+          this.cloudLookup.addresses = addresses;
+      });
+    }
     if (this.cloudLookup) await this.startPunchProbes();
     if (this.closed) return;
     this.trace({
@@ -2166,6 +2196,10 @@ export class P2PSession extends EventEmitter {
    * Low-level: send a `CMD_SET_PAYLOAD` (1350) wrapping `{account_id, cmd:<subCmd>, mChannel,
    * payload, transaction}` over the level-1 channel. The reply arrives as a `NOTIFY_PAYLOAD`
    * (1351) frame (level-1 decrypted, surfaced via the `data` event / `frame.json`).
+   *
+   * `opts.key` makes it a keyed envelope: the sealed per-command key rides ahead of the other fields
+   * as the value's `key`, and the value goes out unencrypted, encryption-type 0, with `=` written
+   * `=` — the form the vendor app sends one in, and the one form the device reads it in.
    */
   sendSetPayload(
     subCmd: number,
@@ -2176,24 +2210,27 @@ export class P2PSession extends EventEmitter {
       omitPayload?: boolean;
       wrapCmd?: number;
       rawValue?: Record<string, unknown>;
+      key?: string;
     } = {},
   ): void {
     if (!this.connectAddress) throw new Error("not connected");
     const channel = opts.channel ?? 0;
+    const keyed = opts.key !== undefined;
     // CMD_SET_PAYLOAD wrapper (reversed from the v6 serializer): inner `cmd` = subCmd,
     // plus mChannel + mValue3:0; the payload object carries any params ({} when none).
     // No `transaction` field in the SET_PAYLOAD value. `rawValue` overrides for testing.
     const inner: Record<string, unknown> = opts.rawValue ?? {
+      ...(keyed ? { key: opts.key } : {}),
       account_id: opts.accountId ?? "",
       cmd: subCmd,
       mChannel: channel,
       mValue3: 0,
       ...(opts.omitPayload ? {} : { payload }),
     };
-    const value = JSON.stringify(inner);
+    const value = keyed ? JSON.stringify(inner).replace(/=/g, "\\u003d") : JSON.stringify(inner);
     const body = Buffer.concat([
       buildCommandHeader(this.seqNumber, opts.wrapCmd ?? CMD_SET_PAYLOAD),
-      buildStringCommandPayload(value, channel, this.level1Key, 1),
+      buildStringCommandPayload(value, channel, keyed ? undefined : this.level1Key, 1),
     ]);
     this.seqNumber = (this.seqNumber + 1) & 0xffff;
     this.logger.debug(`[p2p] ${this.cfg.stationSn} sendSetPayload subCmd=${subCmd}`);

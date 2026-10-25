@@ -298,6 +298,13 @@ const CMD_NOTIFY_PAYLOAD = 1351;
 const PADDED_RESULT_BYTES = 132;
 /** CMD_CAMERA_INFO — a camera reporting its OWN params, as a root-level array. */
 const CMD_CAMERA_INFO = 1103;
+/**
+ * The inner `cmd` of a `CMD_NOTIFY_PAYLOAD` that relays a push message over the session: its `payload` is
+ * the push body as a JSON string — `msg_type`, `event_type`, `device_sn`, `channel`, `trigger_time`,
+ * `unique_id`, `push_count`, `notification_style` — whose `event_type` is the push event code. A HomeBase
+ * sends it on its station channel for an attached device's detection.
+ */
+const NOTIFY_RELAYED_PUSH = 2037;
 const CMD_DATABASE_IMAGE = 1308;
 /** CMD_DATABASE (1306) — P2P SQLite-ish query; reply carries `{cmd:10000,count,data:[…]}`. */
 const CMD_DATABASE = 1306;
@@ -393,6 +400,12 @@ export interface P2PFrame extends P2PDataFrameHeader {
    * the values as device state without any per-capability decoder.
    */
   params?: Record<number, string>;
+  /**
+   * The push envelope the station relayed over its session, when the frame is a `CMD_NOTIFY_PAYLOAD`
+   * carrying one: the frame's JSON, whose `payload` is the push body as a JSON string. Identified by its
+   * shape alone; the body is not interpreted here.
+   */
+  relayedPush?: Record<string, unknown>;
 }
 
 /** Per-process counter behind {@link P2PSession.traceId} — see it for why this is not a serial. */
@@ -2519,6 +2532,12 @@ export class P2PSession extends EventEmitter {
             ? paramReport(frame.json)
             : undefined;
       if (reported) frame.params = reported;
+      if (
+        header.commandId === CMD_NOTIFY_PAYLOAD &&
+        frame.json?.cmd === NOTIFY_RELAYED_PUSH &&
+        typeof frame.json.payload === "string"
+      )
+        frame.relayedPush = frame.json;
     }
     // CMD_NAS_SWITCH (1145) is the RTSP publish switch, but the station also pushes it BACK as a data
     // frame whose string payload is the camera's full authoritative rtsp://user:pass@ip/path — the

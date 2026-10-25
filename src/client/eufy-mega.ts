@@ -61,11 +61,12 @@ import {
   type TuyaDpInbound,
 } from "../core/contracts.js";
 import { noopLogger } from "../core/logger.js";
-import { PushClient } from "../transport/push/push-client.js";
+import { PushClient, normalizePushEvent } from "../transport/push/push-client.js";
 import { FcmRegistrar } from "../transport/push/fcm.js";
 import { MemoryFcmStore } from "../transport/push/store.js";
 import { StoredImageCache } from "../transport/stored-image-cache.js";
 import type { PushEvent, RawPushMessage } from "../transport/push/types.js";
+import { PushRouteDedupe, type PushRoute } from "./push-routes.js";
 import { type AvailabilityObservation, type EufyDevice, type RealtimeTransport } from "../core/types.js";
 import { Timer } from "../core/util.js";
 import {
@@ -326,6 +327,8 @@ export class EufyMega extends EventEmitter {
    * Realtime-only: the poll path deliberately bypasses it so an unchanged state is still re-asserted.
    */
   private readonly lastStateAnnounced = new Map<string, unknown>();
+  /** Pairs a push message's FCM delivery with its station-relayed copy, so the message is announced once. */
+  private readonly pushRoutes = new PushRouteDedupe();
   /** Latest authoritative availability observation per device; no heuristic path writes this map. */
   private readonly availabilityObservations = new Map<string, AvailabilityObservation>();
   /**
@@ -948,6 +951,14 @@ export class EufyMega extends EventEmitter {
    */
   private onP2PFrame(stationSn: string, f: P2PFrame): void {
     this.emit("p2p", f);
+    if (f.relayedPush) {
+      const ev = normalizePushEvent({ payload: f.relayedPush });
+      const eventName = ev.eventType != null ? detectionName(ev.eventType) : undefined;
+      this.announcePush(
+        { ...ev, eventName, stationSn: ev.stationSn ?? stationSn, thumbnailUrl: ev.thumbnailUrl || undefined },
+        "station",
+      );
+    }
     const caps = this.registry.capabilitiesForFrame(stationSn, f.channel);
     const deviceSn = this.registry.serialForFrame(stationSn, f.channel);
     const signal = {
@@ -2349,6 +2360,40 @@ export class EufyMega extends EventEmitter {
   }
 
   /**
+   * Decode one push message into its semantic events and announce them, unless it is the other route's
+   * copy of a message already announced ({@link PushRouteDedupe}). Capabilities map the push `eventType`
+   * to the event (motion / doorbellPress / lockState…) whichever route delivered the body.
+   *
+   * Every message leaves one debug record of what its serial named and how many events it decoded to; a
+   * second copy records `events=0 repeat`. The record never carries the serial.
+   */
+  private announcePush(ev: PushEvent, route: PushRoute): void {
+    const caps = this.capsForEvent(ev.deviceSn);
+    const known = caps ? "known" : ev.deviceSn ? "unknown" : "none";
+    const via = route === "fcm" ? "" : ` via=${route}`;
+    if (this.pushRoutes.repeat(route, ev)) {
+      this.opts.logger?.debug(`[push] in: eventType=${ev.eventType} device=${known} events=0 repeat${via}`);
+      return;
+    }
+    const signal = {
+      source: "push" as const,
+      eventType: ev.eventType,
+      eventName: ev.eventName,
+      deviceSn: ev.deviceSn,
+      stationSn: ev.stationSn,
+      thumbnailUrl: ev.thumbnailUrl,
+      payload: ev.payload as Record<string, unknown>,
+    };
+    const decoded = decodeCapabilityEvent(signal, caps);
+    this.opts.logger?.debug(`[push] in: eventType=${ev.eventType} device=${known} events=${decoded.length}${via}`);
+    for (const out of decoded) {
+      this.emitSemantic(out.event, out.payload, { edge: true, refresh: out.refresh });
+      const dsn = (out.payload.deviceSn as string | undefined) ?? ev.deviceSn;
+      if (dsn) this.prewarmForEvent(out.event, dsn);
+    }
+  }
+
+  /**
    * Connect FCM push — the always-on, server-initiated channel that delivers event + **thumbnail**
    * notifications (motion/person/doorbell/package, each with a thumbnail URL). Independent of
    * MQTT/P2P. On first run it registers a push token, tells the eufy cloud to push to it, then holds
@@ -2397,26 +2442,7 @@ export class EufyMega extends EventEmitter {
       if (ev.eventName === undefined && ev.eventType != null) ev.eventName = detectionName(ev.eventType);
       if (ev.thumbnailCandidate) void this.observeStoredImage(ev.thumbnailCandidate, ev.deviceSn);
       this.emit("push", ev); // raw normalized push (low-level escape hatch)
-      // Capabilities map the push eventType → a semantic event (motion / doorbellPress / lockState…).
-      const signal = {
-        source: "push" as const,
-        eventType: ev.eventType,
-        eventName: ev.eventName,
-        deviceSn: ev.deviceSn,
-        stationSn: ev.stationSn,
-        thumbnailUrl: ev.thumbnailUrl,
-        payload: ev.payload as Record<string, unknown>,
-      };
-      const caps = this.capsForEvent(ev.deviceSn);
-      const decoded = decodeCapabilityEvent(signal, caps);
-      this.opts.logger?.debug(
-        `[push] in: eventType=${ev.eventType} device=${caps ? "known" : ev.deviceSn ? "unknown" : "none"} events=${decoded.length}`,
-      );
-      for (const out of decoded) {
-        this.emitSemantic(out.event, out.payload, { edge: true, refresh: out.refresh });
-        const dsn = (out.payload.deviceSn as string | undefined) ?? ev.deviceSn;
-        if (dsn) this.prewarmForEvent(out.event, dsn);
-      }
+      this.announcePush(ev, "fcm");
       store.save({ creds: persistedCreds, persistentIds: client.getPersistentIds() });
     });
     await new Promise<void>((resolve, reject) => {

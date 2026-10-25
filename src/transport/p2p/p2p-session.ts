@@ -302,7 +302,8 @@ const CMD_CAMERA_INFO = 1103;
  * The inner `cmd` of a `CMD_NOTIFY_PAYLOAD` that relays a push message over the session: its `payload` is
  * the push body as a JSON string — `msg_type`, `event_type`, `device_sn`, `channel`, `trigger_time`,
  * `unique_id`, `push_count`, `notification_style` — whose `event_type` is the push event code. A HomeBase
- * sends it on its station channel for an attached device's detection.
+ * sends it on its station channel for an attached device's detection when that device's notifications are
+ * enabled; a device with notifications off records the event without this relay.
  */
 const NOTIFY_RELAYED_PUSH = 2037;
 const CMD_DATABASE_IMAGE = 1308;
